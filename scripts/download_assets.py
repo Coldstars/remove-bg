@@ -76,15 +76,14 @@ def assets_for(target: str) -> list[Asset]:
             name="BiRefNet-massive-epoch_240",
             path=root / "bin" / "darwin-arm64" / "BiRefNet-massive-epoch_240",
             release_name="BiRefNet-massive-epoch_240-darwin-arm64",
-            md5="68901eb184aca3ab1fbdd9a3361cacdc",
+            md5="9f9b48f187e87819d859c208e510cec5",
             executable=True,
         ),
         "win32-x64": Asset(
             name="BiRefNet-massive-epoch_240.exe",
             path=root / "bin" / "win32-x64" / "BiRefNet-massive-epoch_240.exe",
             release_name="BiRefNet-massive-epoch_240-win32-x64.exe",
-            md5="cb29fa18fc256473133e565ee5c8ee68",
-            executable=True,
+            md5="562c80ce3541d5b43b8751699d8af3fe",
         ),
     }
     return [model, engines[target]]
