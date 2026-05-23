@@ -1,0 +1,28 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Large runtime assets. Fetch them with scripts/download_assets.py.
+bin/*
+!bin/.gitkeep
+!bin/darwin-x64/
+bin/darwin-x64/*
+!bin/darwin-x64/.gitkeep
+!bin/darwin-arm64/
+bin/darwin-arm64/*
+!bin/darwin-arm64/.gitkeep
+!bin/win32-x64/
+bin/win32-x64/*
+!bin/win32-x64/.gitkeep
+models/*
+!models/.gitkeep
+
+# User data and generated outputs.
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+*.log
