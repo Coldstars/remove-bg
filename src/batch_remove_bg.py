@@ -355,40 +355,70 @@ def encode_png_rgba(width: int, height: int, rows: list[bytearray]) -> bytes:
     )
 
 
-def green_dominance(red: int, green: int, blue: int) -> int:
-    return green - max(red, blue)
+def color_distance_sq(a: tuple[int, int, int], b: tuple[int, int, int]) -> int:
+    return sum((left - right) ** 2 for left, right in zip(a, b))
 
 
-def should_remove_green_spill(rows: list[bytearray], width: int, edge_mode: str) -> bool:
-    if edge_mode == "green":
-        return True
-    if edge_mode == "off":
-        return False
-
-    semi_alpha = 0
-    greenish = 0
-    dominance_total = 0
+def estimate_edge_background(rows: list[bytearray], width: int, quality: str) -> tuple[int, int, int] | None:
+    max_alpha = 115 if quality == "clean" else 80
+    totals = [0.0, 0.0, 0.0]
+    weight_total = 0.0
+    samples = 0
 
     for row in rows:
         for x in range(width):
             idx = x * 4
             red, green, blue, alpha = row[idx : idx + 4]
-            if 8 < alpha < 245:
-                semi_alpha += 1
-                dominance = green_dominance(red, green, blue)
-                if dominance > 18 and green > 70:
-                    greenish += 1
-                    dominance_total += dominance
+            if 0 < alpha <= max_alpha:
+                weight = 1.0 + (max_alpha - alpha) / max_alpha
+                totals[0] += red * weight
+                totals[1] += green * weight
+                totals[2] += blue * weight
+                weight_total += weight
+                samples += 1
 
-    if semi_alpha == 0 or greenish == 0:
+    if samples < 12 or weight_total <= 0:
+        return None
+
+    return tuple(max(0, min(255, int(round(total / weight_total)))) for total in totals)
+
+
+def should_remove_edge_spill(
+    rows: list[bytearray],
+    width: int,
+    edge_mode: str,
+    background: tuple[int, int, int] | None,
+    quality: str,
+) -> bool:
+    if edge_mode == "off":
+        return False
+    if edge_mode == "green":
+        return True
+    if background is None:
+        return False
+    if edge_mode == "color":
+        return True
+
+    semi_alpha = 0
+    background_like = 0
+    distance_limit = (62 if quality == "clean" else 48) ** 2
+
+    for row in rows:
+        for x in range(width):
+            idx = x * 4
+            red, green, blue, alpha = row[idx : idx + 4]
+            if 12 < alpha < 230:
+                semi_alpha += 1
+                if color_distance_sq((red, green, blue), background) <= distance_limit:
+                    background_like += 1
+
+    if semi_alpha == 0:
         return False
 
-    greenish_ratio = greenish / semi_alpha
-    avg_dominance = dominance_total / greenish
-    return greenish_ratio >= 0.25 and avg_dominance >= 24
+    return background_like / semi_alpha >= (0.10 if quality == "clean" else 0.16)
 
 
-def remove_green_spill(png_bytes: bytes, edge_mode: str, quality: str) -> bytes:
+def remove_edge_spill(png_bytes: bytes, edge_mode: str, quality: str) -> bytes:
     if edge_mode == "off":
         return png_bytes
 
@@ -397,13 +427,17 @@ def remove_green_spill(png_bytes: bytes, edge_mode: str, quality: str) -> bytes:
     except Exception:
         return png_bytes
 
-    if not should_remove_green_spill(rows, width, edge_mode):
+    clean = quality == "clean"
+    background = (45, 170, 70) if edge_mode == "green" else estimate_edge_background(rows, width, quality)
+
+    if not should_remove_edge_spill(rows, width, edge_mode, background, quality):
         return png_bytes
 
-    clean = quality == "clean"
-    dominance_threshold = 12 if clean else 20
-    clear_alpha = 82 if clean else 30
-    shrink_alpha = 190 if clean else 85
+    assert background is not None
+    clear_alpha = 72 if clean else 30
+    shrink_alpha = 180 if clean else 95
+    close_distance = (72 if clean else 52) ** 2
+    far_distance = (145 if clean else 120) ** 2
 
     for row in rows:
         for x in range(width):
@@ -413,22 +447,33 @@ def remove_green_spill(png_bytes: bytes, edge_mode: str, quality: str) -> bytes:
                 row[idx : idx + 3] = b"\x00\x00\x00"
                 continue
 
-            dominance = green_dominance(red, green, blue)
-            if dominance <= dominance_threshold or green < 55:
+            color = (red, green, blue)
+            distance = color_distance_sq(color, background)
+            if alpha >= 245 and distance > close_distance:
                 continue
 
             edge_weight = max(0.0, min(1.0, (255 - alpha) / 255))
-            if alpha <= clear_alpha and dominance > dominance_threshold:
+            background_weight = max(0.0, min(1.0, 1 - distance / far_distance))
+            strength = edge_weight * background_weight
+            if strength <= 0.03:
+                continue
+
+            if alpha <= clear_alpha and distance <= close_distance:
                 row[idx : idx + 3] = b"\x00\x00\x00"
                 row[idx + 3] = 0
                 continue
 
-            target_green = max(red, blue) + (2 if clean else 14)
-            strength = (0.55 + 0.40 * edge_weight) if clean else (0.18 + 0.42 * edge_weight)
-            row[idx + 1] = max(0, min(255, int(green - (green - target_green) * strength)))
+            alpha_fraction = max(alpha / 255.0, 0.08 if clean else 0.14)
+            unspill_strength = (0.82 if clean else 0.52) * strength
+            corrected = []
+            for channel, bg_channel in zip(color, background):
+                foreground = (channel - bg_channel * (1 - alpha_fraction)) / alpha_fraction
+                target = max(0, min(255, int(round(foreground))))
+                corrected.append(max(0, min(255, int(round(channel + (target - channel) * unspill_strength)))))
+            row[idx : idx + 3] = bytes(corrected)
 
             if clean and alpha < shrink_alpha:
-                alpha_strength = min(0.48, 0.18 + (dominance / 140) * 0.26)
+                alpha_strength = min(0.46, 0.10 + strength * 0.34)
                 row[idx + 3] = max(0, min(255, int(alpha * (1 - alpha_strength))))
 
     return encode_png_rgba(width, height, rows)
@@ -481,7 +526,7 @@ def process_one(
     try:
         data_url = image_to_data_url(input_path)
         png_bytes = server.predict(data_url)
-        png_bytes = remove_green_spill(png_bytes, edge_mode, quality)
+        png_bytes = remove_edge_spill(png_bytes, edge_mode, quality)
         temp_path.write_bytes(png_bytes)
         validate_output(input_path, temp_path)
         temp_path.replace(output_path)
@@ -512,15 +557,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, default=default_model_path(root), help="Model file path")
     parser.add_argument(
         "--edge-mode",
-        choices=("auto", "green", "off"),
+        choices=("auto", "color", "green", "off"),
         default="auto",
-        help="Edge cleanup mode. auto removes green spill only when detected.",
+        help="Edge cleanup mode. auto detects background color spill; color forces generic cleanup.",
     )
     parser.add_argument(
         "--quality",
         choices=("clean", "detail"),
         default="clean",
-        help="Edge cleanup strength. clean removes more green fringe; detail is more conservative.",
+        help="Edge cleanup strength. clean removes more dirty edge; detail is more conservative.",
     )
     return parser.parse_args()
 
