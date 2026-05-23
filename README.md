@@ -5,7 +5,7 @@
 ## 目录
 
 - `src/`：批量处理主程序
-- `scripts/download_assets.py`：按平台校验模型和推理引擎
+- `scripts/download_assets.py`：按平台下载/校验模型和推理引擎
 - `input/`：放需要抠图的图片，支持 `png`、`jpg`、`jpeg`、`webp`
 - `output/`：输出透明 PNG
 - `bin/`：本地推理引擎，大文件，不进入 Git
@@ -19,18 +19,24 @@
 python -m pip install -r requirements.txt
 ```
 
-校验当前平台所需资源：
+下载或校验当前平台所需资源：
 
 ```bash
-python scripts/download_assets.py --check-only
+python scripts/download_assets.py
 ```
 
-模型和推理引擎不进入 Git。第一次在新电脑使用时，把资源文件放到对应路径后再校验：
+模型和推理引擎不进入 Git，而是从本项目 GitHub Release 下载。脚本会自动识别当前平台并补齐所需资源：
 
 - macOS Intel：`bin/darwin-x64/BiRefNet-massive-epoch_240`
 - macOS Apple Silicon：`bin/darwin-arm64/BiRefNet-massive-epoch_240`
 - Windows x64：`bin/win32-x64/BiRefNet-massive-epoch_240.exe`
 - 模型：`models/BiRefNet-massive-epoch_240.pth`
+
+只检查已有资源是否完整，不下载：
+
+```bash
+python scripts/download_assets.py --check-only
+```
 
 ## 使用
 
@@ -90,10 +96,10 @@ Windows 下把 `./run.sh` 换成 `run.bat`。默认不会覆盖原图，也不�
 git clone <your-repo-url>
 cd ai-bg-remover
 python -m pip install -r requirements.txt
-python scripts/download_assets.py --check-only
+python scripts/download_assets.py
 ```
 
-后续要给别人直接使用，建议把代码放 GitHub 仓库，把 `bin/` 和 `models/` 做成单独的 Release 压缩包或放到你自己的对象存储。不要把大模型直接提交进普通 Git 历史。
+后续要给别人直接使用，代码从 Git 仓库拉取，`bin/` 和 `models/` 从 GitHub Release 自动下载。不要把大模型直接提交进普通 Git 历史。
 
 ### 大文件分发建议
 
@@ -101,8 +107,8 @@ python scripts/download_assets.py --check-only
 
 - 普通 Git 仓库只放源码、脚本、README、配置文件
 - `models/` 和 `bin/` 继续由 `.gitignore` 排除
-- 给别人用时，优先发 Release 压缩包，里面可以包含源码、模型、对应平台引擎
-- 要多人协作迭代源码时，大家从 Git 拉代码，再从 Release 包或内部网盘补齐运行资源
+- 给别人用时，大家从 Git 拉代码，再运行 `python scripts/download_assets.py` 自动补齐运行资源
+- Release tag 默认是 `assets-v1`，后续升级资源时可以发布 `assets-v2` 并更新脚本默认值
 
 ## 工作方式
 
@@ -123,6 +129,7 @@ models/BiRefNet-massive-epoch_240.pth
 ## 常见问题
 
 - 提示缺少 Pillow：运行 `python -m pip install -r requirements.txt`
-- 提示模型或引擎缺失：把对应资源文件放到 `bin/` 和 `models/` 后运行 `python scripts/download_assets.py --check-only`
+- 提示模型或引擎缺失：运行 `python scripts/download_assets.py`
+- 提示 Release asset 缺失：说明该平台资源还没有上传到 GitHub Release，上传后重新运行
 - macOS 提示可执行文件不可执行：运行 `chmod +x bin/darwin-x64/BiRefNet-massive-epoch_240`
 - `input/` 为空：放入图片后重新运行
