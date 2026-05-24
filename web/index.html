@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI 智能抠图</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="titlebar">
+        <div class="brand"><span class="brand-dot"></span><span>AI 智能抠图</span></div>
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-mode="image">批量抠图</button>
+          <button class="tab" data-mode="video">视频抠图</button>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <section class="preview-pane">
+          <div id="dropZone" class="drop-zone">
+            <input id="fileInput" type="file" multiple hidden />
+            <div id="previewEmpty" class="preview-empty">
+              <strong>拖拽文件到这里</strong>
+              <span id="dropHint">支持 png / jpg / jpeg / webp</span>
+            </div>
+            <img id="previewImage" class="preview-media hidden" alt="预览" />
+            <video id="previewVideo" class="preview-media hidden" controls muted loop></video>
+            <div id="processingOverlay" class="processing-overlay hidden">
+              <span class="spinner"></span>
+              <span>处理中</span>
+            </div>
+          </div>
+
+          <div class="toolbar">
+            <button id="pickFiles" class="primary">选择文件</button>
+            <button id="submitJob">开始处理</button>
+            <button id="openOutput" disabled>打开输出目录</button>
+            <span id="statusLine" class="status-line">等待文件</span>
+          </div>
+        </section>
+
+        <aside class="side-pane">
+          <section id="paramsPanel" class="panel">
+            <div class="panel-title">参数</div>
+            <div id="videoOptions" class="video-options">
+              <div class="field-row">
+                <label>FPS</label>
+                <input id="fps" type="number" min="1" max="24" value="8" />
+              </div>
+              <div class="field-row">
+                <label>最长边</label>
+                <input id="maxSide" type="number" min="0" step="20" value="540" />
+              </div>
+              <div class="field-row">
+                <label>并发</label>
+                <input id="workers" type="number" min="1" max="4" value="2" />
+              </div>
+              <div class="field-row">
+                <label>平滑</label>
+                <input id="alphaSmooth" type="number" min="0" max="0.85" step="0.05" value="0.10" />
+              </div>
+              <div class="format-grid">
+                <label><input type="checkbox" name="formats" value="apng" checked /> APNG</label>
+                <label><input type="checkbox" name="formats" value="spritesheet" checked /> 精灵图</label>
+                <label><input type="checkbox" name="formats" value="webp" /> WebP</label>
+                <label><input type="checkbox" name="formats" value="webm" /> WebM</label>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel queue-panel">
+            <div id="queueTitle" class="panel-title">任务队列</div>
+            <div id="queue" class="queue"></div>
+          </section>
+        </aside>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

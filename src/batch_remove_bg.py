@@ -44,11 +44,19 @@ class Result:
 
 
 class BackgroundRemoverServer:
-    def __init__(self, program: Path, model: Path, port: int, startup_timeout: int) -> None:
+    def __init__(
+        self,
+        program: Path,
+        model: Path,
+        port: int,
+        startup_timeout: int,
+        monitor_parent: bool = True,
+    ) -> None:
         self.program = program
         self.model = model
         self.port = port
         self.startup_timeout = startup_timeout
+        self.monitor_parent = monitor_parent
         self.process: subprocess.Popen[str] | None = None
 
     @property
@@ -65,9 +73,9 @@ class BackgroundRemoverServer:
             str(self.port),
             "--model-dir",
             str(self.model),
-            "--pid",
-            str(os.getpid()),
         ]
+        if self.monitor_parent:
+            cmd.extend(["--pid", str(os.getpid())])
         print(f"Starting BiRefNet server on port {self.port}...")
         self.process = subprocess.Popen(
             cmd,

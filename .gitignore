@@ -17,12 +17,15 @@ bin/darwin-arm64/*
 !bin/win32-x64/
 bin/win32-x64/*
 !bin/win32-x64/.gitkeep
+!bin/ffmpeg/
+bin/ffmpeg/*
+!bin/ffmpeg/win32-x64/
+bin/ffmpeg/win32-x64/*
+!bin/ffmpeg/win32-x64/.gitkeep
 models/*
 !models/.gitkeep
 
-# User data and generated outputs.
-input/*
-!input/.gitkeep
-output/*
-!output/.gitkeep
+# Runtime workspace and generated outputs.
+workspace/*
+!workspace/.gitkeep
 *.log
