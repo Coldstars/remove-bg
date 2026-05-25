@@ -23,11 +23,13 @@ except ImportError:
 
 from batch_remove_bg import (
     BackgroundRemoverServer,
+    DEFAULT_EDGE_STRENGTH,
+    DEFAULT_EDGE_WIDTH,
     default_engine_path,
     default_model_path,
     image_to_data_url,
     platform_key,
-    remove_edge_spill,
+    refine_edge_spill,
     validate_output,
 )
 
@@ -172,6 +174,8 @@ def remove_frame_backgrounds(
     cutout_dir: Path,
     edge_mode: str,
     quality: str,
+    edge_strength: int,
+    edge_width: int,
 ) -> list[Path]:
     cutout_dir.mkdir(parents=True, exist_ok=True)
     outputs: list[Path] = []
@@ -183,7 +187,7 @@ def remove_frame_backgrounds(
         try:
             data_url = image_to_data_url(frame)
             png_bytes = server.predict(data_url)
-            png_bytes = remove_edge_spill(png_bytes, edge_mode, quality)
+            png_bytes = refine_edge_spill(frame, png_bytes, edge_mode, quality, edge_strength, edge_width)
             temp.write_bytes(png_bytes)
             validate_output(frame, temp)
             temp.replace(output)
@@ -202,6 +206,8 @@ def remove_frame_backgrounds_with_cli(
     cutout_dir: Path,
     edge_mode: str,
     quality: str,
+    edge_strength: int,
+    edge_width: int,
     workers: int,
 ) -> list[Path]:
     cutout_dir.mkdir(parents=True, exist_ok=True)
@@ -225,7 +231,7 @@ def remove_frame_backgrounds_with_cli(
                 ],
                 "BiRefNet frame processing",
             )
-            png_bytes = remove_edge_spill(temp.read_bytes(), edge_mode, quality)
+            png_bytes = refine_edge_spill(frame, temp.read_bytes(), edge_mode, quality, edge_strength, edge_width)
             temp.write_bytes(png_bytes)
             validate_output(frame, temp)
             temp.replace(output)
@@ -389,6 +395,8 @@ def process_video(
                 cutout_dir,
                 args.edge_mode,
                 args.quality,
+                args.edge_strength,
+                args.edge_width,
                 args.workers,
             )
         else:
@@ -398,6 +406,8 @@ def process_video(
                 cutout_dir,
                 args.edge_mode,
                 args.quality,
+                args.edge_strength,
+                args.edge_width,
             )
         if args.alpha_smooth > 0:
             print(f"Smoothing alpha between frames ({args.alpha_smooth:.2f})...")
@@ -461,6 +471,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--engine-mode", choices=("auto", "server", "run"), default="auto", help="BiRefNet execution mode")
     parser.add_argument("--edge-mode", choices=("auto", "color", "green", "off"), default="auto", help="Edge cleanup mode")
     parser.add_argument("--quality", choices=("clean", "detail"), default="clean", help="Edge cleanup strength")
+    parser.add_argument("--edge-strength", type=int, default=DEFAULT_EDGE_STRENGTH, help="Edge refinement intensity, 0-100")
+    parser.add_argument("--edge-width", type=int, default=DEFAULT_EDGE_WIDTH, help="Boundary refinement width, 0-4 pixels")
     return parser.parse_args()
 
 
@@ -489,6 +501,12 @@ def main() -> int:
         return 2
     if not 1 <= args.webp_quality <= 100:
         print("--webp-quality must be between 1 and 100", file=sys.stderr)
+        return 2
+    if not 0 <= args.edge_strength <= 100:
+        print("--edge-strength must be between 0 and 100", file=sys.stderr)
+        return 2
+    if not 0 <= args.edge_width <= 4:
+        print("--edge-width must be between 0 and 4", file=sys.stderr)
         return 2
 
     try:

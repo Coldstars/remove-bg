@@ -101,6 +101,33 @@ button, input, select { font: inherit; }
 }
 
 .drop-zone.drag { border-color: #68c6ec; }
+.drop-zone[data-background="white"] { background: #fff; }
+.drop-zone[data-background="black"] { background: #050505; }
+.drop-zone[data-background="gray"] { background: #69737b; }
+
+.background-switch {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 2;
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid #314a5f;
+  background: rgba(23, 34, 45, 0.92);
+}
+
+.background-option {
+  height: 28px;
+  min-width: 38px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.background-option.active {
+  background: #2a85b8;
+  border-color: #48a2d8;
+}
 
 .preview-empty {
   display: grid;
@@ -184,6 +211,15 @@ button:disabled { opacity: 0.45; cursor: default; }
   margin-bottom: 10px;
 }
 
+.subsection-title {
+  margin: 12px 0 9px;
+  padding-top: 11px;
+  border-top: 1px solid #263a4b;
+  color: #a8bdca;
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .field-row {
   justify-content: space-between;
   gap: 10px;
@@ -199,6 +235,15 @@ button:disabled { opacity: 0.45; cursor: default; }
   width: 132px;
   height: 32px;
   padding: 0 8px;
+}
+
+.field-row input[type="range"] {
+  padding: 0;
+}
+
+.field-row output {
+  margin-left: 5px;
+  color: #65c4ed;
 }
 
 .format-grid {

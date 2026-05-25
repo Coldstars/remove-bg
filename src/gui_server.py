@@ -25,10 +25,12 @@ from urllib.parse import unquote, urlparse
 
 from batch_remove_bg import (
     BackgroundRemoverServer,
+    DEFAULT_EDGE_STRENGTH,
+    DEFAULT_EDGE_WIDTH,
     default_engine_path,
     default_model_path,
     image_to_data_url,
-    remove_edge_spill,
+    refine_edge_spill,
     validate_output,
 )
 from video_remove_bg import (
@@ -70,6 +72,7 @@ class Job:
     error: str = ""
     created_at: float = field(default_factory=time.time)
     message: str = ""
+    options: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -207,20 +210,37 @@ def input_items(job_id: str, upload_dir: Path) -> list[dict[str, str]]:
     return items
 
 
-def process_image_with_cli(program: Path, model: Path, input_path: Path, output_path: Path, edge_mode: str, quality: str) -> None:
+def process_image_with_cli(
+    program: Path,
+    model: Path,
+    input_path: Path,
+    output_path: Path,
+    edge_mode: str,
+    quality: str,
+    edge_strength: int,
+    edge_width: int,
+) -> None:
     temp = output_path.with_name(output_path.stem + ".tmp.png")
     run_command([str(program), "run", "-i", str(input_path), "-o", str(temp), "-m", str(model)], "BiRefNet image processing")
-    png_bytes = remove_edge_spill(temp.read_bytes(), edge_mode, quality)
+    png_bytes = refine_edge_spill(input_path, temp.read_bytes(), edge_mode, quality, edge_strength, edge_width)
     temp.write_bytes(png_bytes)
     validate_output(input_path, temp)
     temp.replace(output_path)
 
 
-def process_image_with_server(server: BackgroundRemoverServer, input_path: Path, output_path: Path, edge_mode: str, quality: str) -> None:
+def process_image_with_server(
+    server: BackgroundRemoverServer,
+    input_path: Path,
+    output_path: Path,
+    edge_mode: str,
+    quality: str,
+    edge_strength: int,
+    edge_width: int,
+) -> None:
     temp = output_path.with_name(output_path.stem + ".tmp.png")
     data_url = image_to_data_url(input_path)
     png_bytes = server.predict(data_url)
-    png_bytes = remove_edge_spill(png_bytes, edge_mode, quality)
+    png_bytes = refine_edge_spill(input_path, png_bytes, edge_mode, quality, edge_strength, edge_width)
     temp.write_bytes(png_bytes)
     validate_output(input_path, temp)
     temp.replace(output_path)
@@ -236,6 +256,8 @@ def run_image_job(job_id: str, options: dict[str, Any]) -> None:
     files = [upload_dir / item["name"] for item in job.inputs]
     edge_mode = options.get("edge_mode", "auto")
     quality = options.get("quality", "clean")
+    edge_strength = int(options.get("edge_strength", DEFAULT_EDGE_STRENGTH))
+    edge_width = int(options.get("edge_width", DEFAULT_EDGE_WIDTH))
     engine = default_engine_path(ROOT)
     model = default_model_path(ROOT)
     server: BackgroundRemoverServer | None = None
@@ -255,9 +277,9 @@ def run_image_job(job_id: str, options: dict[str, Any]) -> None:
             STORE.update(job_id, progress=max(5, int((index - 1) / total * 90)), message=f"处理中：{input_path.name}")
             output_path = (output_dir / input_path.name).with_suffix(".png")
             if server:
-                process_image_with_server(server, input_path, output_path, edge_mode, quality)
+                process_image_with_server(server, input_path, output_path, edge_mode, quality, edge_strength, edge_width)
             else:
-                process_image_with_cli(engine, model, input_path, output_path, edge_mode, quality)
+                process_image_with_cli(engine, model, input_path, output_path, edge_mode, quality, edge_strength, edge_width)
         STORE.update(job_id, status="done", progress=100, outputs=output_items(job_id, output_dir), message="完成")
     except Exception as exc:
         STORE.update(job_id, status="failed", progress=100, error=str(exc), outputs=output_items(job_id, output_dir))
@@ -291,6 +313,8 @@ def run_video_job(job_id: str, options: dict[str, Any]) -> None:
         max_duration=float(options.get("max_duration", DEFAULT_MAX_DURATION)),
         edge_mode=options.get("edge_mode", "auto"),
         quality=options.get("quality", "clean"),
+        edge_strength=int(options.get("edge_strength", DEFAULT_EDGE_STRENGTH)),
+        edge_width=int(options.get("edge_width", DEFAULT_EDGE_WIDTH)),
         workers=max(1, int(options.get("workers", 2))),
         alpha_smooth=float(options.get("alpha_smooth", DEFAULT_ALPHA_SMOOTH)),
         webp_quality=int(options.get("webp_quality", DEFAULT_WEBP_QUALITY)),
@@ -445,7 +469,7 @@ class GuiHandler(SimpleHTTPRequestHandler):
             saved.append({"name": filename, "url": file_url(job_id, f"input/{filename}")})
 
         options = self.form_options(fields, job_type)
-        job = Job(job_id, job_type, "queued", 0, saved, message="排队中")
+        job = Job(job_id, job_type, "queued", 0, saved, message="排队中", options=options)
         STORE.add(job)
         start_worker(job_id, job_type, options)
         self.send_json(asdict(job), 201)
@@ -455,9 +479,18 @@ class GuiHandler(SimpleHTTPRequestHandler):
             values = fields.get(name) or []
             return values[0] if values else default
 
+        def bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
+            try:
+                parsed = int(value(name, str(default)))
+            except ValueError:
+                parsed = default
+            return max(minimum, min(maximum, parsed))
+
         options: dict[str, Any] = {
             "edge_mode": value("edge_mode", "auto"),
             "quality": value("quality", "clean"),
+            "edge_strength": bounded_int("edge_strength", DEFAULT_EDGE_STRENGTH, 0, 100),
+            "edge_width": bounded_int("edge_width", DEFAULT_EDGE_WIDTH, 0, 4),
         }
         if job_type == "video":
             selected = fields.get("formats") or []

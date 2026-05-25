@@ -13,6 +13,7 @@ import os
 import platform
 import signal
 import socket
+import statistics
 import struct
 import subprocess
 import sys
@@ -25,12 +26,15 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageFilter
 except ImportError:
     Image = None
+    ImageFilter = None
 
 SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 DEFAULT_PORT = 54768
+DEFAULT_EDGE_STRENGTH = 60
+DEFAULT_EDGE_WIDTH = 2
 MODEL_NAME = "BiRefNet-massive-epoch_240.pth"
 ENGINE_NAME = "BiRefNet-massive-epoch_240"
 
@@ -196,20 +200,23 @@ def default_model_path(root: Path) -> Path:
     return root / "models" / MODEL_NAME
 
 
+def require_pillow() -> None:
+    if Image is None or ImageFilter is None:
+        raise RuntimeError(
+            "Pillow is required for image processing and edge refinement. "
+            "Run: python -m pip install -r requirements.txt"
+        )
+
+
 def image_to_data_url(path: Path) -> str:
     # Convert every source image to PNG before sending it to the model.
-    # Pillow keeps this path portable across macOS and Windows. macOS can
-    # still fall back to sips when Pillow has not been installed yet.
-    if Image is not None:
-        with Image.open(path) as image:
-            image = image.convert("RGBA")
-            buffer = io.BytesIO()
-            image.save(buffer, format="PNG")
-            data = buffer.getvalue()
-    elif sys.platform == "darwin":
-        data = image_to_png_with_sips(path)
-    else:
-        raise RuntimeError("Pillow is required on this platform. Run: python -m pip install -r requirements.txt")
+    require_pillow()
+    assert Image is not None
+    with Image.open(path) as image:
+        image = image.convert("RGBA")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        data = buffer.getvalue()
     encoded = base64.b64encode(data).decode("ascii")
     return f"data:image/png;base64,{encoded}"
 
@@ -238,22 +245,10 @@ def run_sips(args: list[str]) -> str:
 
 
 def image_size(path: Path) -> tuple[int, int]:
-    if Image is not None:
-        with Image.open(path) as image:
-            return image.size
-    if sys.platform == "darwin":
-        output = run_sips(["-g", "pixelWidth", "-g", "pixelHeight", str(path)])
-        width = height = None
-        for line in output.splitlines():
-            line = line.strip()
-            if line.startswith("pixelWidth:"):
-                width = int(line.split(":", 1)[1].strip())
-            elif line.startswith("pixelHeight:"):
-                height = int(line.split(":", 1)[1].strip())
-        if width is None or height is None:
-            raise ValueError(f"Could not read image size: {path}")
-        return width, height
-    raise RuntimeError("Pillow is required on this platform. Run: python -m pip install -r requirements.txt")
+    require_pillow()
+    assert Image is not None
+    with Image.open(path) as image:
+        return image.size
 
 
 def png_has_alpha(path: Path) -> bool:
@@ -367,124 +362,241 @@ def color_distance_sq(a: tuple[int, int, int], b: tuple[int, int, int]) -> int:
     return sum((left - right) ** 2 for left, right in zip(a, b))
 
 
-def estimate_edge_background(rows: list[bytearray], width: int, quality: str) -> tuple[int, int, int] | None:
-    max_alpha = 115 if quality == "clean" else 80
-    totals = [0.0, 0.0, 0.0]
-    weight_total = 0.0
-    samples = 0
-
-    for row in rows:
-        for x in range(width):
-            idx = x * 4
-            red, green, blue, alpha = row[idx : idx + 4]
-            if 0 < alpha <= max_alpha:
-                weight = 1.0 + (max_alpha - alpha) / max_alpha
-                totals[0] += red * weight
-                totals[1] += green * weight
-                totals[2] += blue * weight
-                weight_total += weight
-                samples += 1
-
-    if samples < 12 or weight_total <= 0:
-        return None
-
-    return tuple(max(0, min(255, int(round(total / weight_total)))) for total in totals)
+def clamp_byte(value: float) -> int:
+    return max(0, min(255, int(round(value))))
 
 
-def should_remove_edge_spill(
-    rows: list[bytearray],
+def local_background_color(
+    original_pixels,
+    alpha_pixels,
+    x: int,
+    y: int,
     width: int,
+    height: int,
+    radius: int,
+) -> tuple[int, int, int] | None:
+    samples: list[tuple[int, int, int]] = []
+    offsets = sorted(
+        (
+            (dx * dx + dy * dy, dx, dy)
+            for dy in range(-radius, radius + 1)
+            for dx in range(-radius, radius + 1)
+            if dx or dy
+        ),
+        key=lambda item: item[0],
+    )
+    for _, dx, dy in offsets:
+        px, py = x + dx, y + dy
+        if 0 <= px < width and 0 <= py < height and alpha_pixels[px, py] <= 10:
+            red, green, blue, _ = original_pixels[px, py]
+            samples.append((red, green, blue))
+            if len(samples) >= 16:
+                break
+    if len(samples) < 3:
+        return None
+    return tuple(int(statistics.median(channel)) for channel in zip(*samples))
+
+
+def local_texture_factor(original_pixels, x: int, y: int, width: int, height: int) -> float:
+    colors: list[tuple[int, int, int]] = []
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            px, py = x + dx, y + dy
+            if 0 <= px < width and 0 <= py < height:
+                colors.append(original_pixels[px, py][:3])
+    if len(colors) < 2:
+        return 1.0
+    ranges = [max(channel) - min(channel) for channel in zip(*colors)]
+    variation = max(ranges)
+    if variation >= 95:
+        return 0.42
+    if variation >= 55:
+        return 0.68
+    return 1.0
+
+
+def local_foreground_color(
+    original_pixels,
+    alpha_pixels,
+    candidate_pixels,
+    background: tuple[int, int, int],
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    radius: int,
+) -> tuple[int, int, int] | None:
+    samples: list[tuple[int, int, int]] = []
+    offsets = sorted(
+        (
+            (dx * dx + dy * dy, dx, dy)
+            for dy in range(-radius, radius + 1)
+            for dx in range(-radius, radius + 1)
+            if dx or dy
+        ),
+        key=lambda item: item[0],
+    )
+    for _, dx, dy in offsets:
+        px, py = x + dx, y + dy
+        if not (0 <= px < width and 0 <= py < height):
+            continue
+        color = original_pixels[px, py][:3]
+        if alpha_pixels[px, py] >= 235 and not candidate_pixels[px, py] and color_distance_sq(color, background) > 68 ** 2:
+            samples.append(color)
+            if len(samples) >= 12:
+                break
+    if len(samples) < 3:
+        return None
+    return tuple(int(statistics.median(channel)) for channel in zip(*samples))
+
+
+def estimate_background_mix(
+    source: tuple[int, int, int],
+    foreground: tuple[int, int, int],
+    background: tuple[int, int, int],
+) -> tuple[float, float]:
+    direction = tuple(bg - fg for fg, bg in zip(foreground, background))
+    denominator = sum(value * value for value in direction)
+    if denominator < 32 ** 2:
+        return 0.0, float("inf")
+    mixture = sum((channel - fg) * value for channel, fg, value in zip(source, foreground, direction)) / denominator
+    mixture = max(0.0, min(1.0, mixture))
+    projected = tuple(fg + value * mixture for fg, value in zip(foreground, direction))
+    residual = sum((channel - projected_channel) ** 2 for channel, projected_channel in zip(source, projected)) ** 0.5
+    return mixture, residual
+
+
+def refine_edge_spill(
+    original_path: Path,
+    png_bytes: bytes,
     edge_mode: str,
-    background: tuple[int, int, int] | None,
     quality: str,
-) -> bool:
-    if edge_mode == "off":
-        return False
-    if edge_mode == "green":
-        return True
-    if background is None:
-        return False
-    if edge_mode == "color":
-        return True
-
-    semi_alpha = 0
-    background_like = 0
-    distance_limit = (62 if quality == "clean" else 48) ** 2
-
-    for row in rows:
-        for x in range(width):
-            idx = x * 4
-            red, green, blue, alpha = row[idx : idx + 4]
-            if 12 < alpha < 230:
-                semi_alpha += 1
-                if color_distance_sq((red, green, blue), background) <= distance_limit:
-                    background_like += 1
-
-    if semi_alpha == 0:
-        return False
-
-    return background_like / semi_alpha >= (0.10 if quality == "clean" else 0.16)
-
-
-def remove_edge_spill(png_bytes: bytes, edge_mode: str, quality: str) -> bytes:
+    edge_strength: int = DEFAULT_EDGE_STRENGTH,
+    edge_width: int = DEFAULT_EDGE_WIDTH,
+) -> bytes:
     if edge_mode == "off":
         return png_bytes
 
-    try:
-        width, height, rows = decode_png_rgba(png_bytes)
-    except Exception:
+    require_pillow()
+    assert Image is not None and ImageFilter is not None
+    edge_strength = max(0, min(100, edge_strength))
+    edge_width = max(0, min(4, edge_width))
+    if edge_strength == 0 or edge_width == 0:
         return png_bytes
 
+    with Image.open(original_path) as original_image, Image.open(io.BytesIO(png_bytes)) as cutout_image:
+        original = original_image.convert("RGBA")
+        cutout = cutout_image.convert("RGBA")
+    if original.size != cutout.size:
+        return png_bytes
+
+    width, height = cutout.size
+    alpha = cutout.getchannel("A")
+    alpha_pixels = alpha.load()
+    original_pixels = original.load()
+    result_pixels = cutout.load()
+    outside = alpha.point(lambda value: 255 if value <= 10 else 0)
+    band_radius = min(7, edge_width + 3)
+    candidates = outside.filter(ImageFilter.MaxFilter(band_radius * 2 + 1))
+    candidate_pixels = candidates.load()
     clean = quality == "clean"
-    background = (45, 170, 70) if edge_mode == "green" else estimate_edge_background(rows, width, quality)
+    strength = edge_strength / 100.0
+    sample_radius = edge_width + 5
+    foreground_radius = edge_width + 11
+    close_limit = (118 if edge_mode == "color" else 96) ** 2
+    spill_limit = (185 if clean else 160) ** 2
 
-    if not should_remove_edge_spill(rows, width, edge_mode, background, quality):
-        return png_bytes
-
-    assert background is not None
-    clear_alpha = 72 if clean else 30
-    shrink_alpha = 180 if clean else 95
-    close_distance = (72 if clean else 52) ** 2
-    far_distance = (145 if clean else 120) ** 2
-
-    for row in rows:
+    for y in range(height):
         for x in range(width):
-            idx = x * 4
-            red, green, blue, alpha = row[idx : idx + 4]
-            if alpha == 0:
-                row[idx : idx + 3] = b"\x00\x00\x00"
+            rgba = result_pixels[x, y]
+            red, green, blue, current_alpha = rgba
+            if current_alpha == 0:
+                result_pixels[x, y] = (0, 0, 0, 0)
+                continue
+            if not candidate_pixels[x, y]:
                 continue
 
-            color = (red, green, blue)
-            distance = color_distance_sq(color, background)
-            if alpha >= 245 and distance > close_distance:
+            background = local_background_color(
+                original_pixels,
+                alpha_pixels,
+                x,
+                y,
+                width,
+                height,
+                sample_radius,
+            )
+            if background is None:
+                if edge_mode != "green":
+                    continue
+                background = (45, 170, 70)
+
+            source_color = original_pixels[x, y][:3]
+            distance = color_distance_sq(source_color, background)
+            similarity = max(0.0, 1.0 - distance / spill_limit)
+
+            texture_factor = local_texture_factor(original_pixels, x, y, width, height)
+            alpha_factor = max(0.12, 1.0 - current_alpha / 255.0)
+            correction = strength * similarity * (0.55 + alpha_factor * 0.60) * texture_factor
+            foreground = local_foreground_color(
+                original_pixels,
+                alpha_pixels,
+                candidate_pixels,
+                background,
+                x,
+                y,
+                width,
+                height,
+                foreground_radius,
+            )
+            mixture = residual = 0.0
+            if foreground is not None:
+                mixture, residual = estimate_background_mix(source_color, foreground, background)
+                if residual <= (56 if clean else 42) and mixture >= 0.05:
+                    mix_strength = strength * (0.92 if clean else 0.62)
+                    target_alpha = clamp_byte(255 * (1.0 - mixture))
+                    if target_alpha < current_alpha:
+                        current_alpha = clamp_byte(current_alpha + (target_alpha - current_alpha) * mix_strength)
+                    rgb_strength = min(0.96, mix_strength * (0.48 + mixture * 0.62))
+                    red, green, blue = (
+                        clamp_byte(channel + (target - channel) * rgb_strength)
+                        for channel, target in zip((red, green, blue), foreground)
+                    )
+                    result_pixels[x, y] = (red, green, blue, current_alpha)
+                    if current_alpha <= (82 if clean else 44) and mixture >= 0.38:
+                        result_pixels[x, y] = (0, 0, 0, 0)
+                    continue
+
+            if edge_mode == "auto" and similarity < 0.10 and mixture < 0.08 and current_alpha >= 210:
                 continue
 
-            edge_weight = max(0.0, min(1.0, (255 - alpha) / 255))
-            background_weight = max(0.0, min(1.0, 1 - distance / far_distance))
-            strength = edge_weight * background_weight
-            if strength <= 0.03:
+            # A nearly solid pixel matching nearby removed background is a retained rim.
+            if current_alpha >= 210 and distance <= close_limit:
+                rim_texture_factor = 1.0 if distance <= (56 ** 2) else texture_factor
+                rim_reduction = strength * similarity * (0.62 if clean else 0.42) * rim_texture_factor
+                new_alpha = clamp_byte(current_alpha * (1.0 - rim_reduction))
+                if distance <= (56 ** 2) and edge_strength >= 55:
+                    new_alpha = min(new_alpha, clamp_byte(current_alpha * (0.16 if clean else 0.38)))
+                current_alpha = new_alpha
+                result_pixels[x, y] = (red, green, blue, current_alpha)
+
+            if current_alpha <= (82 if clean else 44) and similarity >= 0.52:
+                result_pixels[x, y] = (0, 0, 0, 0)
+                continue
+            if correction <= 0.025 or current_alpha == 0:
                 continue
 
-            if alpha <= clear_alpha and distance <= close_distance:
-                row[idx : idx + 3] = b"\x00\x00\x00"
-                row[idx + 3] = 0
-                continue
+            alpha_fraction = max(current_alpha / 255.0, 0.10 if clean else 0.16)
+            corrected: list[int] = []
+            for channel, bg_channel in zip(source_color, background):
+                foreground = (channel - bg_channel * (1.0 - alpha_fraction)) / alpha_fraction
+                corrected.append(clamp_byte(channel + (clamp_byte(foreground) - channel) * correction))
+            if clean and current_alpha < 205:
+                current_alpha = clamp_byte(current_alpha * (1.0 - correction * 0.20))
+            result_pixels[x, y] = (*corrected, current_alpha)
 
-            alpha_fraction = max(alpha / 255.0, 0.08 if clean else 0.14)
-            unspill_strength = (0.82 if clean else 0.52) * strength
-            corrected = []
-            for channel, bg_channel in zip(color, background):
-                foreground = (channel - bg_channel * (1 - alpha_fraction)) / alpha_fraction
-                target = max(0, min(255, int(round(foreground))))
-                corrected.append(max(0, min(255, int(round(channel + (target - channel) * unspill_strength)))))
-            row[idx : idx + 3] = bytes(corrected)
-
-            if clean and alpha < shrink_alpha:
-                alpha_strength = min(0.46, 0.10 + strength * 0.34)
-                row[idx + 3] = max(0, min(255, int(alpha * (1 - alpha_strength))))
-
-    return encode_png_rgba(width, height, rows)
+    buffer = io.BytesIO()
+    cutout.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def validate_output(input_path: Path, output_path: Path) -> None:
@@ -525,6 +637,8 @@ def process_one(
     overwrite: bool,
     edge_mode: str,
     quality: str,
+    edge_strength: int,
+    edge_width: int,
 ) -> Result:
     output_path = output_path_for(input_path, input_dir, output_dir)
     if output_path.exists() and not overwrite:
@@ -534,7 +648,7 @@ def process_one(
     try:
         data_url = image_to_data_url(input_path)
         png_bytes = server.predict(data_url)
-        png_bytes = remove_edge_spill(png_bytes, edge_mode, quality)
+        png_bytes = refine_edge_spill(input_path, png_bytes, edge_mode, quality, edge_strength, edge_width)
         temp_path.write_bytes(png_bytes)
         validate_output(input_path, temp_path)
         temp_path.replace(output_path)
@@ -544,6 +658,52 @@ def process_one(
             with contextlib.suppress(Exception):
                 temp_path.unlink()
         return Result(input_path, output_path, "failed", str(exc))
+
+
+def process_one_with_cli(
+    program: Path,
+    model: Path,
+    input_path: Path,
+    input_dir: Path,
+    output_dir: Path,
+    overwrite: bool,
+    edge_mode: str,
+    quality: str,
+    edge_strength: int,
+    edge_width: int,
+) -> Result:
+    output_path = output_path_for(input_path, input_dir, output_dir)
+    if output_path.exists() and not overwrite:
+        return Result(input_path, output_path, "skipped", "output exists")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    model_output = output_path.with_name(output_path.stem + ".engine.tmp.png")
+    final_output = output_path.with_name(output_path.stem + ".tmp.png")
+    try:
+        result = subprocess.run(
+            [str(program), "run", "-i", str(input_path), "-o", str(model_output), "-m", str(model)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(message or f"BiRefNet run failed with code {result.returncode}")
+        png_bytes = refine_edge_spill(
+            input_path,
+            model_output.read_bytes(),
+            edge_mode,
+            quality,
+            edge_strength,
+            edge_width,
+        )
+        final_output.write_bytes(png_bytes)
+        validate_output(input_path, final_output)
+        final_output.replace(output_path)
+        return Result(input_path, output_path, "ok")
+    except Exception as exc:
+        return Result(input_path, output_path, "failed", str(exc))
+    finally:
+        model_output.unlink(missing_ok=True)
+        final_output.unlink(missing_ok=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -575,6 +735,18 @@ def parse_args() -> argparse.Namespace:
         default="clean",
         help="Edge cleanup strength. clean removes more dirty edge; detail is more conservative.",
     )
+    parser.add_argument(
+        "--edge-strength",
+        type=int,
+        default=DEFAULT_EDGE_STRENGTH,
+        help="Edge refinement intensity from 0 to 100. Defaults to 60.",
+    )
+    parser.add_argument(
+        "--edge-width",
+        type=int,
+        default=DEFAULT_EDGE_WIDTH,
+        help="Boundary refinement width from 0 to 4 pixels. Defaults to 2.",
+    )
     return parser.parse_args()
 
 
@@ -583,6 +755,12 @@ def main() -> int:
     input_dir = args.input.expanduser().resolve()
     output_dir = args.output.expanduser().resolve()
     patterns = args.patterns or ["*.png", "*.jpg", "*.jpeg", "*.webp"]
+    if not 0 <= args.edge_strength <= 100:
+        print("--edge-strength must be between 0 and 100", file=sys.stderr)
+        return 2
+    if not 0 <= args.edge_width <= 4:
+        print("--edge-width must be between 0 and 4", file=sys.stderr)
+        return 2
 
     if not input_dir.exists():
         print(f"Input folder does not exist: {input_dir}", file=sys.stderr)
@@ -609,21 +787,27 @@ def main() -> int:
             print(f"[{index}/{total}] {result.input_path.name}")
             print(f"  skipped ({result.message})")
     else:
-        server = BackgroundRemoverServer(
+        server: BackgroundRemoverServer | None = BackgroundRemoverServer(
             args.bin.expanduser().resolve(),
             args.model.expanduser().resolve(),
             args.port,
             args.startup_timeout,
+            monitor_parent=False,
         )
         try:
-            server.start()
+            try:
+                server.start()
+            except Exception:
+                server.stop()
+                server = None
+                print("BiRefNet server mode failed; falling back to single-image run mode.")
             total = len(files)
             for index, input_path in enumerate(files, start=1):
                 print(f"[{index}/{total}] {input_path.name}")
                 planned_output = output_path_for(input_path, input_dir, output_dir)
                 if planned_output.exists() and not args.overwrite:
                     result = Result(input_path, planned_output, "skipped", "output exists")
-                else:
+                elif server is not None:
                     result = process_one(
                         server,
                         input_path,
@@ -632,6 +816,21 @@ def main() -> int:
                         args.overwrite,
                         args.edge_mode,
                         args.quality,
+                        args.edge_strength,
+                        args.edge_width,
+                    )
+                else:
+                    result = process_one_with_cli(
+                        args.bin.expanduser().resolve(),
+                        args.model.expanduser().resolve(),
+                        input_path,
+                        input_dir,
+                        output_dir,
+                        args.overwrite,
+                        args.edge_mode,
+                        args.quality,
+                        args.edge_strength,
+                        args.edge_width,
                     )
                 results.append(result)
                 if result.status == "ok":
@@ -641,7 +840,8 @@ def main() -> int:
                 else:
                     print(f"  failed: {result.message}", file=sys.stderr)
         finally:
-            server.stop()
+            if server is not None:
+                server.stop()
 
     ok = sum(1 for r in results if r.status == "ok")
     skipped = sum(1 for r in results if r.status == "skipped")

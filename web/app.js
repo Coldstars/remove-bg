@@ -6,6 +6,7 @@ const state = {
   activeJobId: null,
   selectedKey: null,
   selectedObjectUrl: null,
+  previewBackground: "checker",
 };
 
 const els = {
@@ -24,6 +25,19 @@ const els = {
   queue: document.getElementById("queue"),
   queueTitle: document.getElementById("queueTitle"),
   paramsPanel: document.getElementById("paramsPanel"),
+  videoOptions: document.getElementById("videoOptions"),
+  edgePreset: document.getElementById("edgePreset"),
+  edgeStrength: document.getElementById("edgeStrength"),
+  edgeStrengthValue: document.getElementById("edgeStrengthValue"),
+  edgeWidth: document.getElementById("edgeWidth"),
+  backgroundOptions: document.querySelectorAll(".background-option"),
+};
+
+const edgePresets = {
+  balanced: { edge_mode: "auto", quality: "clean", edge_strength: 60, edge_width: 2 },
+  detail: { edge_mode: "auto", quality: "detail", edge_strength: 38, edge_width: 1 },
+  clean: { edge_mode: "color", quality: "clean", edge_strength: 100, edge_width: 4 },
+  off: { edge_mode: "off", quality: "detail", edge_strength: 0, edge_width: 0 },
 };
 
 function setMode(mode) {
@@ -32,7 +46,7 @@ function setMode(mode) {
   state.activeJobId = null;
   state.selectedKey = null;
   els.tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.mode === mode));
-  els.paramsPanel.classList.toggle("hidden", mode !== "video");
+  els.videoOptions.classList.toggle("hidden", mode !== "video");
   els.queueTitle.textContent = mode === "image" ? "图片列表" : "任务队列";
   els.fileInput.multiple = mode === "image";
   els.fileInput.accept = mode === "image" ? ".png,.jpg,.jpeg,.webp" : ".mp4,.mov,.m4v,.webm,.avi,.mkv";
@@ -154,6 +168,35 @@ function formValue(id) {
   return document.getElementById(id).value;
 }
 
+function applyEdgePreset(name) {
+  const preset = edgePresets[name];
+  if (!preset) return;
+  els.edgeStrength.value = preset.edge_strength;
+  els.edgeWidth.value = preset.edge_width;
+  els.edgeStrengthValue.textContent = preset.edge_strength;
+  els.edgePreset.dataset.mode = preset.edge_mode;
+  els.edgePreset.dataset.quality = preset.quality;
+}
+
+function edgeOptions() {
+  const preset = edgePresets[els.edgePreset.value] || {
+    edge_mode: els.edgePreset.dataset.mode || "auto",
+    quality: els.edgePreset.dataset.quality || "clean",
+  };
+  return {
+    edge_mode: preset.edge_mode,
+    quality: preset.quality,
+    edge_strength: Number(els.edgeStrength.value),
+    edge_width: Number(els.edgeWidth.value),
+  };
+}
+
+function setPreviewBackground(background) {
+  state.previewBackground = background;
+  els.dropZone.dataset.background = background;
+  els.backgroundOptions.forEach((button) => button.classList.toggle("active", button.dataset.background === background));
+}
+
 async function submitJob() {
   if (!state.files.length) {
     setStatus("请先选择文件");
@@ -161,8 +204,8 @@ async function submitJob() {
   }
   const form = new FormData();
   state.files.forEach((file) => form.append("files", file));
-  form.append("edge_mode", "auto");
-  form.append("quality", "clean");
+  const edge = edgeOptions();
+  Object.entries(edge).forEach(([key, value]) => form.append(key, value));
   if (state.mode === "video") {
     form.append("fps", formValue("fps"));
     form.append("max_side", formValue("maxSide"));
@@ -368,6 +411,15 @@ els.pickFiles.addEventListener("click", () => els.fileInput.click());
 els.fileInput.addEventListener("change", () => showFiles(els.fileInput.files));
 els.submitJob.addEventListener("click", submitJob);
 els.openOutput.addEventListener("click", openOutput);
+els.edgePreset.addEventListener("change", () => applyEdgePreset(els.edgePreset.value));
+els.edgeStrength.addEventListener("input", () => {
+  els.edgeStrengthValue.textContent = els.edgeStrength.value;
+  els.edgePreset.value = "custom";
+});
+els.edgeWidth.addEventListener("input", () => {
+  els.edgePreset.value = "custom";
+});
+els.backgroundOptions.forEach((button) => button.addEventListener("click", () => setPreviewBackground(button.dataset.background)));
 
 ["dragenter", "dragover"].forEach((eventName) => {
   els.dropZone.addEventListener(eventName, (event) => {
@@ -385,6 +437,8 @@ els.openOutput.addEventListener("click", openOutput);
 
 els.dropZone.addEventListener("drop", (event) => showFiles(event.dataTransfer.files));
 
+applyEdgePreset("balanced");
+setPreviewBackground("checker");
 setMode("image");
 refreshJobs();
 setInterval(refreshJobs, 1500);
