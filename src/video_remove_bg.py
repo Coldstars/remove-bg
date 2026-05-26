@@ -11,15 +11,17 @@ import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Protocol
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageChops
 except ImportError:
     Image = None
+    ImageChops = None
 
 from batch_remove_bg import (
     BackgroundRemoverServer,
@@ -37,9 +39,9 @@ SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
 DEFAULT_FPS = 12
 DEFAULT_MAX_DURATION = 10.0
 DEFAULT_MAX_SIDE = 720
-DEFAULT_ALPHA_SMOOTH = 0.10
+DEFAULT_ALPHA_SMOOTH = 0.0
 DEFAULT_WEBP_QUALITY = 88
-DEFAULT_FORMATS = ("apng", "spritesheet")
+DEFAULT_FORMATS = ("apng", "png_sequence", "gif", "spritesheet")
 
 
 @dataclass
@@ -48,6 +50,13 @@ class VideoResult:
     status: str
     outputs: list[Path]
     message: str = ""
+    frame_count: int = 0
+    inference_seconds: float = 0.0
+
+
+class ImagePredictor(Protocol):
+    def predict(self, image_data_url: str) -> bytes:
+        ...
 
 
 def repo_root() -> Path:
@@ -124,6 +133,8 @@ def output_targets(video: Path, output_dir: Path, output_format: str) -> list[Pa
             output_dir / f"{stem}_spritesheet.png",
             output_dir / f"{stem}_spritesheet.json",
         ]
+    if output_format == "png_sequence":
+        return [output_dir / f"{stem}_png_frames.zip"]
     ext = "apng" if output_format == "apng" else output_format
     return [output_dir / f"{stem}.{ext}"]
 
@@ -169,7 +180,7 @@ def extract_frames(
 
 
 def remove_frame_backgrounds(
-    server: BackgroundRemoverServer,
+    server: ImagePredictor,
     frames: list[Path],
     cutout_dir: Path,
     edge_mode: str,
@@ -262,7 +273,7 @@ def remove_frame_backgrounds_with_cli(
 def smooth_alpha_frames(frames: list[Path], strength: float) -> None:
     if strength <= 0:
         return
-    if Image is None:
+    if Image is None or ImageChops is None:
         raise RuntimeError("Pillow is required for alpha smoothing")
     strength = max(0.0, min(0.85, strength))
     previous_alpha = None
@@ -271,7 +282,11 @@ def smooth_alpha_frames(frames: list[Path], strength: float) -> None:
             image = image.convert("RGBA")
             red, green, blue, alpha = image.split()
             if previous_alpha is not None and previous_alpha.size == alpha.size:
-                alpha = Image.blend(alpha, previous_alpha, strength)
+                blended = Image.blend(alpha, previous_alpha, strength)
+                current_subject = alpha.point(lambda value: 255 if value > 10 else 0)
+                previous_subject = previous_alpha.point(lambda value: 255 if value > 10 else 0)
+                overlap = ImageChops.darker(current_subject, previous_subject)
+                alpha = Image.composite(blended, alpha, overlap)
                 image.putalpha(alpha)
                 image.save(frame)
             previous_alpha = alpha.copy()
@@ -307,7 +322,16 @@ def synthesize_with_ffmpeg(
     elif output_format == "apng":
         args = [*base_args, "-plays", "0", "-f", "apng", str(output)]
     elif output_format == "gif":
-        args = [*base_args, str(output)]
+        args = [
+            *base_args,
+            "-filter_complex",
+            "[0:v]split[a][b];"
+            "[a]palettegen=reserve_transparent=1:transparency_color=ffffff[p];"
+            "[b][p]paletteuse=alpha_threshold=80",
+            "-loop",
+            "0",
+            str(output),
+        ]
     elif output_format == "webm":
         args = [
             *base_args,
@@ -357,8 +381,28 @@ def synthesize_spritesheet(frames: list[Path], outputs: list[Path], fps: int) ->
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
+def synthesize_png_sequence(frames: list[Path], output: Path, fps: int) -> None:
+    """Package transparent PNG frames into one downloadable archive."""
+    if Image is None:
+        raise RuntimeError("Pillow is required for PNG sequence output")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(frames[0]) as first:
+        width, height = first.size
+    metadata = {
+        "fps": fps,
+        "frame_count": len(frames),
+        "frame_width": width,
+        "frame_height": height,
+        "pattern": "frame_%06d.png",
+    }
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("metadata.json", json.dumps(metadata, indent=2))
+        for frame in frames:
+            archive.write(frame, frame.name)
+
+
 def process_video(
-    server: BackgroundRemoverServer | None,
+    server: ImagePredictor | None,
     ffmpeg: Path,
     ffprobe: Path,
     video: Path,
@@ -387,6 +431,7 @@ def process_video(
         extract_frames(ffmpeg, video, args.fps, frames_dir, True, args.max_side)
         frames = sorted(frames_dir.glob("frame_*.png"))
         print(f"Removing backgrounds for {len(frames)} frames...")
+        inference_started = time.perf_counter()
         if server is None:
             cutout_frames = remove_frame_backgrounds_with_cli(
                 args.bin,
@@ -409,6 +454,7 @@ def process_video(
                 args.edge_strength,
                 args.edge_width,
             )
+        inference_seconds = time.perf_counter() - inference_started
         if args.alpha_smooth > 0:
             print(f"Smoothing alpha between frames ({args.alpha_smooth:.2f})...")
             smooth_alpha_frames(cutout_frames, args.alpha_smooth)
@@ -418,6 +464,8 @@ def process_video(
             format_targets = output_targets(video, args.output, output_format)
             if output_format == "spritesheet":
                 synthesize_spritesheet(cutout_frames, format_targets, args.fps)
+            elif output_format == "png_sequence":
+                synthesize_png_sequence(cutout_frames, format_targets[0], args.fps)
             else:
                 synthesize_with_ffmpeg(
                     ffmpeg,
@@ -429,7 +477,7 @@ def process_video(
                     args.webp_lossless,
                 )
             written_outputs.extend(format_targets)
-        return VideoResult(video, "ok", written_outputs)
+        return VideoResult(video, "ok", written_outputs, frame_count=len(frames), inference_seconds=inference_seconds)
     except Exception as exc:
         return VideoResult(video, "failed", targets, str(exc))
     finally:
@@ -452,7 +500,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--format",
         action="append",
-        choices=("webp", "apng", "gif", "webm", "spritesheet"),
+        choices=("webp", "apng", "gif", "webm", "png_sequence", "spritesheet"),
         default=None,
         help="Output format. Can be repeated. Defaults to apng and spritesheet.",
     )
@@ -469,7 +517,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bin", type=Path, default=default_engine_path(root), help="BiRefNet engine binary path")
     parser.add_argument("--model", type=Path, default=default_model_path(root), help="BiRefNet model file path")
     parser.add_argument("--engine-mode", choices=("auto", "server", "run"), default="auto", help="BiRefNet execution mode")
-    parser.add_argument("--edge-mode", choices=("auto", "color", "green", "off"), default="auto", help="Edge cleanup mode")
+    parser.add_argument("--edge-mode", choices=("auto", "color", "green", "off"), default="off", help="Edge cleanup mode; disabled by default to preserve Massive alpha")
     parser.add_argument("--quality", choices=("clean", "detail"), default="clean", help="Edge cleanup strength")
     parser.add_argument("--edge-strength", type=int, default=DEFAULT_EDGE_STRENGTH, help="Edge refinement intensity, 0-100")
     parser.add_argument("--edge-width", type=int, default=DEFAULT_EDGE_WIDTH, help="Boundary refinement width, 0-4 pixels")

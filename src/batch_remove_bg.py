@@ -466,6 +466,104 @@ def estimate_background_mix(
     return mixture, residual
 
 
+def refine_edge_spill_numpy(
+    original,
+    cutout,
+    edge_mode: str,
+    quality: str,
+    edge_strength: int,
+    edge_width: int,
+) -> bytes | None:
+    """Accelerate local edge cleanup with array operations when NumPy is installed."""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+
+    source = np.asarray(original, dtype=np.float32)
+    result = np.asarray(cutout, dtype=np.uint8).copy()
+    alpha = result[:, :, 3].astype(np.float32)
+    outside = alpha <= 10
+    band_radius = min(7, edge_width + 3)
+    band = np.asarray(
+        Image.fromarray((outside * 255).astype("uint8"), "L").filter(ImageFilter.MaxFilter(band_radius * 2 + 1))
+    ) > 0
+    candidate = band & (alpha > 0)
+    if not candidate.any():
+        buffer = io.BytesIO()
+        Image.fromarray(result, "RGBA").save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    def local_average(mask, radius):
+        weight = np.asarray(
+            Image.fromarray((mask * 255).astype("uint8"), "L").filter(ImageFilter.BoxBlur(radius)),
+            dtype=np.float32,
+        ) / 255.0
+        channels = []
+        for channel in range(3):
+            weighted = (source[:, :, channel] * mask).astype("uint8")
+            channels.append(
+                np.asarray(Image.fromarray(weighted, "L").filter(ImageFilter.BoxBlur(radius)), dtype=np.float32)
+                / np.maximum(weight, 1e-4)
+            )
+        return np.stack(channels, axis=2), weight > 0.015
+
+    background, has_background = local_average(outside, edge_width + 5)
+    opaque = (alpha >= 235) & ~candidate
+    foreground, has_foreground = local_average(opaque, edge_width + 11)
+    if edge_mode == "green":
+        background[~has_background] = (45, 170, 70)
+        has_background[:] = True
+
+    valid = candidate & has_background
+    source_rgb = source[:, :, :3]
+    working_rgb = result[:, :, :3].astype(np.float32)
+    distance = ((source_rgb - background) ** 2).sum(axis=2)
+    clean = quality == "clean"
+    strength = edge_strength / 100.0
+    close_limit = (118 if edge_mode == "color" else 96) ** 2
+    spill_limit = (185 if clean else 160) ** 2
+    similarity = np.clip(1.0 - distance / spill_limit, 0.0, 1.0)
+    alpha_factor = np.maximum(0.12, 1.0 - alpha / 255.0)
+    correction = strength * similarity * (0.55 + alpha_factor * 0.60)
+
+    direction = background - foreground
+    denominator = (direction**2).sum(axis=2)
+    mixture = np.clip(((source_rgb - foreground) * direction).sum(axis=2) / np.maximum(denominator, 1.0), 0.0, 1.0)
+    projected = foreground + direction * mixture[:, :, None]
+    residual = np.sqrt(((source_rgb - projected) ** 2).sum(axis=2))
+    mixed = valid & has_foreground & (denominator >= 32**2) & (residual <= (56 if clean else 42)) & (mixture >= 0.05)
+    mix_strength = strength * (0.92 if clean else 0.62)
+    target_alpha = 255.0 * (1.0 - mixture)
+    alpha[mixed] += (np.minimum(alpha, target_alpha) - alpha)[mixed] * mix_strength
+    rgb_strength = np.minimum(0.96, mix_strength * (0.48 + mixture * 0.62))
+    working_rgb[mixed] += (foreground - working_rgb)[mixed] * rgb_strength[mixed, None]
+
+    rim = valid & ~mixed & (alpha >= 210) & (distance <= close_limit)
+    rim_reduction = strength * similarity * (0.62 if clean else 0.42)
+    alpha[rim] *= 1.0 - rim_reduction[rim]
+    strong_rim = rim & (distance <= 56**2) & (edge_strength >= 55)
+    alpha[strong_rim] = np.minimum(alpha[strong_rim], result[:, :, 3][strong_rim] * (0.16 if clean else 0.38))
+
+    remaining = valid & ~mixed & ~rim & (correction > 0.025) & (alpha > 0)
+    alpha_fraction = np.maximum(alpha / 255.0, 0.10 if clean else 0.16)
+    unmixed = (source_rgb - background * (1.0 - alpha_fraction[:, :, None])) / alpha_fraction[:, :, None]
+    unmixed = np.clip(unmixed, 0.0, 255.0)
+    working_rgb[remaining] += (unmixed - working_rgb)[remaining] * correction[remaining, None]
+    if clean:
+        soften = remaining & (alpha < 205)
+        alpha[soften] *= 1.0 - correction[soften] * 0.20
+
+    clear = valid & (alpha <= (82 if clean else 44)) & (similarity >= 0.52)
+    alpha[clear] = 0
+    result[:, :, :3] = np.clip(working_rgb, 0, 255).astype("uint8")
+    result[:, :, 3] = np.clip(alpha, 0, 255).astype("uint8")
+    result[result[:, :, 3] == 0, :3] = 0
+    buffer = io.BytesIO()
+    Image.fromarray(result, "RGBA").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 def refine_edge_spill(
     original_path: Path,
     png_bytes: bytes,
@@ -489,6 +587,9 @@ def refine_edge_spill(
         cutout = cutout_image.convert("RGBA")
     if original.size != cutout.size:
         return png_bytes
+    accelerated = refine_edge_spill_numpy(original, cutout, edge_mode, quality, edge_strength, edge_width)
+    if accelerated is not None:
+        return accelerated
 
     width, height = cutout.size
     alpha = cutout.getchannel("A")

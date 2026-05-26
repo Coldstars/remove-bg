@@ -7,6 +7,7 @@ const state = {
   selectedKey: null,
   selectedObjectUrl: null,
   previewBackground: "checker",
+  runtime: null,
 };
 
 const els = {
@@ -22,14 +23,17 @@ const els = {
   previewVideo: document.getElementById("previewVideo"),
   processingOverlay: document.getElementById("processingOverlay"),
   statusLine: document.getElementById("statusLine"),
+  runtimeBadge: document.getElementById("runtimeBadge"),
   queue: document.getElementById("queue"),
   queueTitle: document.getElementById("queueTitle"),
   paramsPanel: document.getElementById("paramsPanel"),
+  edgeOptions: document.getElementById("edgeOptions"),
   videoOptions: document.getElementById("videoOptions"),
   edgePreset: document.getElementById("edgePreset"),
   edgeStrength: document.getElementById("edgeStrength"),
   edgeStrengthValue: document.getElementById("edgeStrengthValue"),
   edgeWidth: document.getElementById("edgeWidth"),
+  workers: document.getElementById("workers"),
   backgroundOptions: document.querySelectorAll(".background-option"),
 };
 
@@ -47,6 +51,8 @@ function setMode(mode) {
   state.selectedKey = null;
   els.tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.mode === mode));
   els.videoOptions.classList.toggle("hidden", mode !== "video");
+  els.paramsPanel.classList.toggle("hidden", mode !== "video");
+  els.edgeOptions.classList.add("hidden");
   els.queueTitle.textContent = mode === "image" ? "图片列表" : "任务队列";
   els.fileInput.multiple = mode === "image";
   els.fileInput.accept = mode === "image" ? ".png,.jpg,.jpeg,.webp" : ".mp4,.mov,.m4v,.webm,.avi,.mkv";
@@ -239,6 +245,31 @@ async function refreshJobs() {
   refreshSelectedPreview();
 }
 
+async function refreshRuntime() {
+  try {
+    const response = await fetch("/api/runtime");
+    state.runtime = await response.json();
+    const runtime = state.runtime;
+    const usesCuda = ["cuda", "cuda_available", "loading"].includes(runtime.backend);
+    els.runtimeBadge.classList.toggle("cuda", usesCuda);
+    els.runtimeBadge.classList.toggle("fallback", runtime.backend === "cpu_fallback");
+    if (runtime.backend === "cuda") {
+      els.runtimeBadge.textContent = `CUDA · ${runtime.gpu_name} · Massive FP32`;
+    } else if (runtime.backend === "loading") {
+      els.runtimeBadge.textContent = "CUDA · 正在加载 Massive 模型";
+    } else if (runtime.backend === "cuda_available") {
+      els.runtimeBadge.textContent = `CUDA · ${runtime.gpu_name} · Massive FP32 待加载`;
+    } else {
+      els.runtimeBadge.textContent = "CPU 回退";
+      els.runtimeBadge.title = runtime.fallback_reason || "当前使用 CPU";
+    }
+    els.workers.disabled = usesCuda;
+    els.workers.title = usesCuda ? "CUDA 模式使用单模型常驻推理，无需设置并发" : "CPU 单图回退模式的并发数";
+  } catch (error) {
+    els.runtimeBadge.textContent = "状态未知";
+  }
+}
+
 function renderQueue() {
   els.queue.innerHTML = "";
   if (state.files.length) {
@@ -296,11 +327,13 @@ function imageRows(job) {
 
 function videoRow(job) {
   const input = job.inputs?.[0] || {};
-  const firstOutput = (job.outputs || []).find((item) => /\.(png|webp|apng)$/i.test(item.name));
+  const firstOutput = videoPreviewOutput(job);
   return {
     key: job.id,
     title: input.name || job.id,
-    subtitle: job.status === "done" ? `${job.outputs.length} 个输出` : job.error || job.message || statusFor(job.status),
+    subtitle: job.status === "done"
+      ? `${job.frame_count || 0} 帧 · ${job.device === "cuda" ? "CUDA" : "CPU"} · ${job.total_seconds || 0}s`
+      : job.error || job.message || statusFor(job.status),
     status: job.status,
     thumbUrl: firstOutput?.url || input.url,
     active: state.selectedKey === job.id,
@@ -345,12 +378,19 @@ function selectItem(job, inputName = null) {
     setStatus(output ? "处理完成" : job.error || job.message || statusFor(job.status));
   } else {
     state.selectedKey = job.id;
-    const output = (job.outputs || []).find((item) => /\.(png|webp|apng)$/i.test(item.name));
+    const output = videoPreviewOutput(job);
     const input = job.inputs?.[0];
-    showUrl((output || input)?.url, job.type === "video" && !output, job.status === "running");
+    const videoOutput = output && /\.webm$/i.test(output.name);
+    showUrl((output || input)?.url, job.type === "video" && (!output || videoOutput), job.status === "running");
     setStatus(job.error || job.message || statusFor(job.status));
   }
   renderQueue();
+}
+
+function videoPreviewOutput(job) {
+  const outputs = job.outputs || [];
+  return outputs.find((item) => /\.(apng|gif|webp|png)$/i.test(item.name))
+    || outputs.find((item) => /\.webm$/i.test(item.name));
 }
 
 function refreshSelectedPreview() {
@@ -437,8 +477,10 @@ els.backgroundOptions.forEach((button) => button.addEventListener("click", () =>
 
 els.dropZone.addEventListener("drop", (event) => showFiles(event.dataTransfer.files));
 
-applyEdgePreset("balanced");
+applyEdgePreset("off");
 setPreviewBackground("checker");
 setMode("image");
 refreshJobs();
+refreshRuntime();
 setInterval(refreshJobs, 1500);
+setInterval(refreshRuntime, 1500);

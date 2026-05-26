@@ -9,7 +9,10 @@
   <body>
     <main class="app-shell">
       <header class="titlebar">
-        <div class="brand"><span class="brand-dot"></span><span>AI 智能抠图</span></div>
+        <div class="brand">
+          <span class="brand-dot"></span><span>AI 智能抠图</span>
+          <span id="runtimeBadge" class="runtime-badge">检测加速中</span>
+        </div>
         <div class="tabs" role="tablist">
           <button class="tab active" data-mode="image">批量抠图</button>
           <button class="tab" data-mode="video">视频抠图</button>
@@ -47,37 +50,37 @@
         </section>
 
         <aside class="side-pane">
-          <section id="paramsPanel" class="panel">
+          <section id="paramsPanel" class="panel hidden">
             <div class="panel-title">参数</div>
-            <div class="edge-options">
+            <div id="edgeOptions" class="edge-options hidden">
               <div class="field-row">
                 <label for="edgePreset">边缘优化</label>
                 <select id="edgePreset">
-                  <option value="balanced" selected>平衡</option>
+                  <option value="balanced">平衡</option>
                   <option value="detail">细节优先</option>
                   <option value="clean">干净优先</option>
-                  <option value="off">关闭</option>
+                  <option value="off" selected>关闭</option>
                   <option value="custom">自定义</option>
                 </select>
               </div>
               <div class="field-row">
-                <label for="edgeStrength">去边力度 <output id="edgeStrengthValue">60</output></label>
-                <input id="edgeStrength" type="range" min="0" max="100" value="60" />
+                <label for="edgeStrength">去边力度 <output id="edgeStrengthValue">0</output></label>
+                <input id="edgeStrength" type="range" min="0" max="100" value="0" />
               </div>
               <div class="field-row">
                 <label for="edgeWidth">收边宽度</label>
-                <input id="edgeWidth" type="number" min="0" max="4" value="2" />
+                <input id="edgeWidth" type="number" min="0" max="4" value="0" />
               </div>
             </div>
             <div id="videoOptions" class="video-options hidden">
               <div class="subsection-title">视频</div>
               <div class="field-row">
                 <label>FPS</label>
-                <input id="fps" type="number" min="1" max="24" value="8" />
+                <input id="fps" type="number" min="1" max="24" value="12" />
               </div>
               <div class="field-row">
                 <label>最长边</label>
-                <input id="maxSide" type="number" min="0" step="20" value="540" />
+                <input id="maxSide" type="number" min="0" step="20" value="720" />
               </div>
               <div class="field-row">
                 <label>并发</label>
@@ -85,13 +88,15 @@
               </div>
               <div class="field-row">
                 <label>平滑</label>
-                <input id="alphaSmooth" type="number" min="0" max="0.85" step="0.05" value="0.10" />
+                <input id="alphaSmooth" type="number" min="0" max="0.85" step="0.05" value="0.00" />
               </div>
               <div class="format-grid">
                 <label><input type="checkbox" name="formats" value="apng" checked /> APNG</label>
                 <label><input type="checkbox" name="formats" value="spritesheet" checked /> 精灵图</label>
                 <label><input type="checkbox" name="formats" value="webp" /> WebP</label>
                 <label><input type="checkbox" name="formats" value="webm" /> WebM</label>
+                <label><input type="checkbox" name="formats" value="gif" checked /> GIF</label>
+                <label><input type="checkbox" name="formats" value="png_sequence" checked /> PNG 序列帧</label>
               </div>
             </div>
           </section>

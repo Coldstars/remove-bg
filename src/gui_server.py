@@ -33,6 +33,7 @@ from batch_remove_bg import (
     refine_edge_spill,
     validate_output,
 )
+from cuda_birefnet import CudaBiRefNetBackend
 from video_remove_bg import (
     DEFAULT_ALPHA_SMOOTH,
     DEFAULT_FPS,
@@ -73,6 +74,11 @@ class Job:
     created_at: float = field(default_factory=time.time)
     message: str = ""
     options: dict[str, Any] = field(default_factory=dict)
+    backend: str = ""
+    device: str = ""
+    frame_count: int = 0
+    inference_seconds: float = 0.0
+    total_seconds: float = 0.0
 
 
 @dataclass
@@ -122,13 +128,28 @@ class JobStore:
         with self.lock:
             return sorted(self.jobs.values(), key=lambda item: item.created_at, reverse=True)
 
+    def clear(self) -> None:
+        with self.lock:
+            self.jobs = {}
+            self.save()
+
 
 STORE = JobStore()
+CUDA_BACKEND = CudaBiRefNetBackend(ROOT)
+CUDA_JOB_LOCK = threading.Lock()
 
 
 def ensure_dirs() -> None:
     for path in (UPLOADS, OUTPUTS, TEMP, JOBS_DIR):
         path.mkdir(parents=True, exist_ok=True)
+
+
+def clear_previous_session() -> None:
+    """Start each GUI session with an empty queue while preserving exported results."""
+    for path in (UPLOADS, TEMP):
+        shutil.rmtree(path, ignore_errors=True)
+    ensure_dirs()
+    STORE.clear()
 
 
 def safe_filename(name: str) -> str:
@@ -229,7 +250,7 @@ def process_image_with_cli(
 
 
 def process_image_with_server(
-    server: BackgroundRemoverServer,
+    server: Any,
     input_path: Path,
     output_path: Path,
     edge_mode: str,
@@ -246,7 +267,21 @@ def process_image_with_server(
     temp.replace(output_path)
 
 
+def try_cuda_backend(job_id: str) -> CudaBiRefNetBackend | None:
+    if not CUDA_BACKEND.is_available():
+        return None
+    STORE.update(job_id, message="首次加载 CUDA BiRefNet Massive 模型" if CUDA_BACKEND.model is None else "使用 CUDA Massive 抠图")
+    try:
+        CUDA_BACKEND.ensure_loaded()
+        STORE.update(job_id, backend="birefnet_massive_cuda_fp32", device="cuda", message="CUDA · Massive FP32 抠图中")
+        return CUDA_BACKEND
+    except Exception as exc:
+        STORE.update(job_id, message=f"CUDA 不可用，切换 CPU：{exc}")
+        return None
+
+
 def run_image_job(job_id: str, options: dict[str, Any]) -> None:
+    started = time.perf_counter()
     job = STORE.get(job_id)
     if job is None:
         return
@@ -260,35 +295,55 @@ def run_image_job(job_id: str, options: dict[str, Any]) -> None:
     edge_width = int(options.get("edge_width", DEFAULT_EDGE_WIDTH))
     engine = default_engine_path(ROOT)
     model = default_model_path(ROOT)
-    server: BackgroundRemoverServer | None = None
+    predictor: Any = None
+    engine_server: BackgroundRemoverServer | None = None
     STORE.update(job_id, status="running", progress=2, message="启动抠图引擎")
     try:
-        try:
-            server = BackgroundRemoverServer(engine, model, 54768, 120, monitor_parent=False)
-            server.start()
-        except Exception:
-            if server:
-                server.stop()
-            server = None
-            STORE.update(job_id, message="server 模式不可用，切换单图模式")
+        predictor = try_cuda_backend(job_id)
+        if predictor is None:
+            try:
+                engine_server = BackgroundRemoverServer(engine, model, 54768, 120, monitor_parent=False)
+                engine_server.start()
+                predictor = engine_server
+                STORE.update(job_id, backend="cpu_server", device="cpu", message="CPU 服务模式抠图中")
+            except Exception:
+                if engine_server:
+                    engine_server.stop()
+                engine_server = None
+                STORE.update(job_id, backend="cpu_run", device="cpu", message="CUDA/server 不可用，切换 CPU 单图模式")
 
-        total = max(len(files), 1)
-        for index, input_path in enumerate(files, start=1):
-            STORE.update(job_id, progress=max(5, int((index - 1) / total * 90)), message=f"处理中：{input_path.name}")
-            output_path = (output_dir / input_path.name).with_suffix(".png")
-            if server:
-                process_image_with_server(server, input_path, output_path, edge_mode, quality, edge_strength, edge_width)
-            else:
-                process_image_with_cli(engine, model, input_path, output_path, edge_mode, quality, edge_strength, edge_width)
-        STORE.update(job_id, status="done", progress=100, outputs=output_items(job_id, output_dir), message="完成")
+        gpu_task = predictor is CUDA_BACKEND
+        if gpu_task:
+            STORE.update(job_id, message="等待 CUDA 队列")
+        lock = CUDA_JOB_LOCK if gpu_task else contextlib.nullcontext()
+        with lock:
+            total = max(len(files), 1)
+            inference_started = time.perf_counter()
+            for index, input_path in enumerate(files, start=1):
+                STORE.update(job_id, progress=max(5, int((index - 1) / total * 90)), message=f"处理中：{input_path.name}")
+                output_path = (output_dir / input_path.name).with_suffix(".png")
+                if predictor:
+                    process_image_with_server(predictor, input_path, output_path, edge_mode, quality, edge_strength, edge_width)
+                else:
+                    process_image_with_cli(engine, model, input_path, output_path, edge_mode, quality, edge_strength, edge_width)
+            STORE.update(
+                job_id,
+                status="done",
+                progress=100,
+                outputs=output_items(job_id, output_dir),
+                inference_seconds=round(time.perf_counter() - inference_started, 3),
+                message="完成",
+            )
     except Exception as exc:
         STORE.update(job_id, status="failed", progress=100, error=str(exc), outputs=output_items(job_id, output_dir))
     finally:
-        if server:
-            server.stop()
+        if engine_server:
+            engine_server.stop()
+        STORE.update(job_id, total_seconds=round(time.perf_counter() - started, 3))
 
 
 def run_video_job(job_id: str, options: dict[str, Any]) -> None:
+    started = time.perf_counter()
     job = STORE.get(job_id)
     if job is None:
         return
@@ -323,7 +378,8 @@ def run_video_job(job_id: str, options: dict[str, Any]) -> None:
         bin=engine,
         model=model,
     )
-    server: BackgroundRemoverServer | None = None
+    predictor: Any = None
+    engine_server: BackgroundRemoverServer | None = None
     try:
         STORE.update(job_id, status="running", progress=5, message="检查视频")
         validate_tools(ffmpeg, ffprobe)
@@ -331,27 +387,46 @@ def run_video_job(job_id: str, options: dict[str, Any]) -> None:
         if duration > args.max_duration:
             raise ValueError(f"视频时长 {duration:.2f}s 超过限制 {args.max_duration:.2f}s")
         STORE.update(job_id, progress=12, message="启动抠图引擎")
-        if options.get("engine_mode", "auto") != "run":
+        predictor = try_cuda_backend(job_id)
+        if predictor is None and options.get("engine_mode", "auto") != "run":
             try:
-                server = BackgroundRemoverServer(engine, model, 54768, 120, monitor_parent=False)
-                server.start()
+                engine_server = BackgroundRemoverServer(engine, model, 54768, 120, monitor_parent=False)
+                engine_server.start()
+                predictor = engine_server
+                STORE.update(job_id, backend="cpu_server", device="cpu", message="CPU 服务模式抠图中")
             except Exception:
-                if server:
-                    server.stop()
+                if engine_server:
+                    engine_server.stop()
                 if options.get("engine_mode") == "server":
                     raise
-                server = None
-                STORE.update(job_id, message="server 模式不可用，切换单图模式")
-        STORE.update(job_id, progress=20, message="抽帧与抠图中")
-        result = process_video(server, ffmpeg, ffprobe, video, args)
+                engine_server = None
+                STORE.update(job_id, backend="cpu_run", device="cpu", message="CUDA/server 不可用，切换 CPU 单图模式")
+        elif predictor is None:
+            STORE.update(job_id, backend="cpu_run", device="cpu", message="使用 CPU 单图模式")
+        gpu_task = predictor is CUDA_BACKEND
+        if gpu_task:
+            STORE.update(job_id, progress=20, message="等待 CUDA 队列")
+        lock = CUDA_JOB_LOCK if gpu_task else contextlib.nullcontext()
+        with lock:
+            STORE.update(job_id, progress=20, message="抽帧与抠图中")
+            result = process_video(predictor, ffmpeg, ffprobe, video, args)
         if result.status != "ok":
             raise RuntimeError(result.message or "视频处理失败")
-        STORE.update(job_id, status="done", progress=100, outputs=output_items(job_id, output_dir), message="完成")
+        STORE.update(
+            job_id,
+            status="done",
+            progress=100,
+            outputs=output_items(job_id, output_dir),
+            frame_count=result.frame_count,
+            inference_seconds=round(result.inference_seconds, 3),
+            message="完成",
+        )
     except Exception as exc:
         STORE.update(job_id, status="failed", progress=100, error=str(exc), outputs=output_items(job_id, output_dir))
     finally:
-        if server:
-            server.stop()
+        if engine_server:
+            engine_server.stop()
+        STORE.update(job_id, total_seconds=round(time.perf_counter() - started, 3))
 
 
 def start_worker(job_id: str, job_type: str, options: dict[str, Any]) -> None:
@@ -384,6 +459,8 @@ class GuiHandler(SimpleHTTPRequestHandler):
             return self.serve_static(WEB_DIR / "index.html")
         if path == "/api/jobs":
             return self.send_json([asdict(job) for job in STORE.list()])
+        if path == "/api/runtime":
+            return self.send_json(CUDA_BACKEND.status())
         if path.startswith("/api/jobs/"):
             job = STORE.get(path.rsplit("/", 1)[-1])
             if not job:
@@ -487,15 +564,20 @@ class GuiHandler(SimpleHTTPRequestHandler):
             return max(minimum, min(maximum, parsed))
 
         options: dict[str, Any] = {
-            "edge_mode": value("edge_mode", "auto"),
+            "edge_mode": value("edge_mode", "off"),
             "quality": value("quality", "clean"),
-            "edge_strength": bounded_int("edge_strength", DEFAULT_EDGE_STRENGTH, 0, 100),
-            "edge_width": bounded_int("edge_width", DEFAULT_EDGE_WIDTH, 0, 4),
+            "edge_strength": bounded_int("edge_strength", 0, 0, 100),
+            "edge_width": bounded_int("edge_width", 0, 0, 4),
         }
         if job_type == "video":
             selected = fields.get("formats") or []
             options.update(
                 {
+                    # Generic edge cleanup causes visible halos on gradient
+                    # video backgrounds; preserve Massive's original alpha.
+                    "edge_mode": "off",
+                    "edge_strength": 0,
+                    "edge_width": 0,
                     "fps": value("fps", str(DEFAULT_FPS)),
                     "max_side": value("max_side", str(DEFAULT_MAX_SIDE)),
                     "workers": value("workers", "2"),
@@ -524,6 +606,7 @@ def main() -> int:
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
     ensure_dirs()
+    clear_previous_session()
     port = find_port(args.port)
     server = ThreadingHTTPServer(("127.0.0.1", port), GuiHandler)
     url = f"http://127.0.0.1:{port}"

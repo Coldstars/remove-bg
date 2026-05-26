@@ -46,6 +46,31 @@ button, input, select { font: inherit; }
 
 .brand { gap: 9px; font-weight: 700; }
 
+.runtime-badge {
+  margin-left: 10px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 9px;
+  border: 1px solid #35536a;
+  border-radius: 12px;
+  color: #9eb7c8;
+  background: #1b2a36;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.runtime-badge.cuda {
+  border-color: #237e64;
+  color: #92e6c5;
+  background: rgba(26, 106, 82, 0.2);
+}
+
+.runtime-badge.fallback {
+  border-color: #765a34;
+  color: #ecc887;
+}
+
 .brand-dot {
   width: 14px;
   height: 14px;
